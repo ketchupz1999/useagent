@@ -1,6 +1,7 @@
 import { Hono } from "hono";
 import {
   CHILD_SESSION_TOOL_NAMES,
+  childSessionRefusalResult,
   executeChildSessionToolLocal,
 } from "./child-session-tools";
 import { resolveToolRunIdentity } from "./run-authorization";
@@ -57,11 +58,17 @@ internalChildSessionRoutes.post("/", async (c) => {
     return c.json({ error: "invalid_arguments" }, 400);
   }
 
-  return c.json({
-    result: await executeChildSessionToolLocal(
-      current,
-      name,
-      args as Record<string, unknown>,
-    ),
-  });
+  try {
+    return c.json({
+      result: await executeChildSessionToolLocal(
+        current,
+        name,
+        args as Record<string, unknown>,
+      ),
+    });
+  } catch (error) {
+    const refusal = childSessionRefusalResult(error);
+    if (refusal) return c.json({ result: refusal });
+    throw error;
+  }
 });

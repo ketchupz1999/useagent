@@ -79,4 +79,30 @@ describe("child-session gateway control-plane delegation", () => {
     expect(result.isError).toBe(true);
     expect(result.content[0]?.text).toContain("not configured");
   });
+
+  test("returns a structured control-plane refusal to the agent", async () => {
+    process.env.GATEWAY_DATABASE_URL = "postgres://restricted";
+    process.env.USEAGENT_API_ORIGIN = "http://127.0.0.1:3201";
+    globalThis.fetch = (async (_input, _init) => Response.json(
+      {
+        error: "fleet_queue_full",
+        message: "fleet queue is full for org org-a (limit 4)",
+        limit: 4,
+      },
+      { status: 429 },
+    )) as typeof fetch;
+
+    const result = await executeChildSessionTool(claims, "child_session_create", {
+      idempotencyKey: "queue-full",
+      prompt: "do a thing",
+    });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0]?.text).toBe("fleet queue is full for org org-a (limit 4)");
+    expect(result.structuredContent).toEqual({
+      code: "fleet_queue_full",
+      status: 429,
+      limit: 4,
+    });
+  });
 });

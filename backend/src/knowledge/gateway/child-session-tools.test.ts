@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { and, eq, isNotNull, isNull, like } from "drizzle-orm";
 import "../../index";
-import { commands, providerEvents, runs } from "../../db/schema";
+import { commands, providerEvents, runs, spendAccounts } from "../../db/schema";
 import { db } from "../../db/client";
 import { createRun, setRunStatus } from "../../runs/repo";
 import { recordProviderEvent } from "../../runs/provider-events";
@@ -9,9 +9,12 @@ import { createGatewayApp } from "../../gateway-app";
 import { advertisedGatewayToolDescriptors, executeRegisteredGatewayTool } from "./operation-registry";
 import {
   CHILD_SESSION_TOOLS,
+  childSessionRefusalResult,
   executeChildSessionTool,
 } from "./child-session-tools";
 import { mintToolToken, type ToolTokenClaims } from "./token";
+import { RunAdmissionClosedError } from "../../commands/admission";
+import { SandboxMinutesExceededError } from "../../runs/sandbox-minutes";
 
 const touchedOrgs = new Set<string>();
 
@@ -25,6 +28,8 @@ const ENV_KEYS = [
   "PRODUCT_CHILD_THREADS",
   "GATEWAY_DATABASE_URL",
   "USEAGENT_API_ORIGIN",
+  "FLEET_ORG_MAX_QUEUE_DEPTH",
+  "SPEND_ALLOWANCE_USD",
 ] as const;
 
 let savedEnv: Partial<Record<(typeof ENV_KEYS)[number], string | undefined>> =
@@ -58,6 +63,7 @@ afterEach(async () => {
     await db
       .delete(runs)
       .where(and(eq(runs.orgId, orgId), isNull(runs.parentRunId)));
+    await db.delete(spendAccounts).where(eq(spendAccounts.orgId, orgId));
   }
   touchedOrgs.clear();
   for (const key of ENV_KEYS) {
@@ -112,6 +118,33 @@ function childId(
 }
 
 describe("child session gateway tools", () => {
+  test("refusal mapping preserves release and sandbox guidance", () => {
+    const release = childSessionRefusalResult(new RunAdmissionClosedError({
+      open: false,
+      operationId: "release-test",
+      actor: "test",
+      reason: "deploying",
+      changedAt: "2026-10-25T00:00:00.000Z",
+    }));
+    expect(release?.content[0]?.text).toBe(
+      "A release is being installed. Send your task again in a moment.",
+    );
+    expect(release?.structuredContent).toEqual({
+      code: "run_admission_closed",
+      retryable: true,
+    });
+
+    const sandbox = childSessionRefusalResult(
+      new SandboxMinutesExceededError(10, 10),
+    );
+    expect(sandbox?.content[0]?.text).toContain("10 of your 10 sandbox minutes");
+    expect(sandbox?.structuredContent).toEqual({
+      code: "sandbox_minutes_exceeded",
+      used: 10,
+      cap: 10,
+    });
+  });
+
   test("batch advertisement is rollout honest", () => {
     const names = () => advertisedGatewayToolDescriptors({ childSessions: true, slack: false }).map((tool) => tool.name);
     expect(names()).not.toContain("child_session_create_many");
@@ -258,6 +291,77 @@ describe("child session gateway tools", () => {
         ),
       );
     expect(childCommands).toHaveLength(1);
+  });
+
+  test("create names the queue limit when the durable queue is full", async () => {
+    process.env.FLEET_ORG_MAX_QUEUE_DEPTH = "1";
+    const claims = await fixture();
+    const first = await executeChildSessionTool(claims, "child_session_create", {
+      idempotencyKey: "queue-first",
+      prompt: "Occupy the only queue slot.",
+    });
+    expect(first.isError).toBeUndefined();
+
+    const refused = await executeChildSessionTool(claims, "child_session_create", {
+      idempotencyKey: "queue-second",
+      prompt: "This child should be refused.",
+    });
+
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]?.text).toContain("fleet queue is full");
+    expect(refused.content[0]?.text).toContain("limit 1");
+    expect(refused.structuredContent).toMatchObject({
+      code: "fleet_queue_full",
+      retryable: true,
+      limit: 1,
+    });
+  });
+
+  test("create carries the spend allowance message", async () => {
+    process.env.SPEND_ALLOWANCE_USD = "5";
+    const claims = await fixture();
+    await db.insert(spendAccounts).values({
+      orgId: claims.orgId,
+      userId: claims.userId,
+      spentUsd: 5,
+    });
+
+    const refused = await executeChildSessionTool(claims, "child_session_create", {
+      idempotencyKey: "spend-refused",
+      prompt: "This child should be refused.",
+    });
+
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]?.text).toBe(
+      "You have spent $5.00 of your $5.00 allowance. New tasks are paused until it is raised.",
+    );
+    expect(refused.structuredContent).toMatchObject({
+      code: "spend_allowance_exceeded",
+      spent: 5,
+      allowance: 5,
+    });
+  });
+
+  test("create_many returns a structured queue refusal", async () => {
+    process.env.PRODUCT_CHILD_THREADS = "on";
+    process.env.FLEET_ORG_MAX_QUEUE_DEPTH = "1";
+    const claims = await fixture();
+
+    const refused = await executeChildSessionTool(claims, "child_session_create_many", {
+      idempotencyKey: "batch-queue-full",
+      children: [
+        { title: "One", prompt: "First child." },
+        { title: "Two", prompt: "Second child." },
+      ],
+    });
+
+    expect(refused.isError).toBe(true);
+    expect(refused.content[0]?.text).toContain("fleet queue is full");
+    expect(refused.structuredContent).toMatchObject({
+      code: "fleet_queue_full",
+      retryable: true,
+      limit: 1,
+    });
   });
 
   test("list, events, and gather are bounded durable projections", async () => {

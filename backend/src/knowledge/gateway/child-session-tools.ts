@@ -20,6 +20,10 @@ import type { GatewayToolListOptions } from "./operation-registry";
 import { botsEnabled } from "../../bots/rollout";
 import { productFlagsForToolList } from "./product-flags";
 import { ENGINE_IDS, type EngineId } from "../../db/schema";
+import { RunAdmissionClosedError } from "../../commands/admission";
+import { FleetQueueLimitError } from "../../fleet/intake";
+import { SandboxMinutesExceededError } from "../../runs/sandbox-minutes";
+import { SpendAllowanceExceededError } from "../../runs/spend";
 
 const MAX_TEXT_EVENT_LINES = 20;
 const MAX_TEXT_PAYLOAD_CHARS = 320;
@@ -265,6 +269,37 @@ async function currentRun(claims: ToolTokenClaims) {
   return run?.status === "running" ? run : null;
 }
 
+export function childSessionRefusalResult(error: unknown): ToolCallResult | null {
+  if (error instanceof FleetQueueLimitError) {
+    return errorResult(error.message, {
+      code: error.code,
+      retryable: true,
+      limit: error.limit,
+    });
+  }
+  if (error instanceof SpendAllowanceExceededError) {
+    return errorResult(error.message, {
+      code: error.code,
+      spent: error.spent,
+      allowance: error.allowance,
+    });
+  }
+  if (error instanceof SandboxMinutesExceededError) {
+    return errorResult(error.message, {
+      code: error.code,
+      used: error.used,
+      cap: error.cap,
+    });
+  }
+  if (error instanceof RunAdmissionClosedError) {
+    return errorResult(error.body.message, {
+      code: error.code,
+      retryable: true,
+    });
+  }
+  return null;
+}
+
 async function create(
   claims: ToolTokenClaims,
   args: Record<string, unknown>,
@@ -287,19 +322,26 @@ async function create(
     );
   }
 
-  const outcome = await createChildSession({
-    orgId: claims.orgId,
-    actorId: claims.userId || null,
-    parentRunId: run.id,
-    threadId: run.threadId,
-    prompt,
-    title: title || undefined,
-    engine: run.engine,
-    model: run.model,
-    repos: run.repos,
-    memoryScope: run.memoryScope,
-    idempotencyKey,
-  });
+  let outcome: Awaited<ReturnType<typeof createChildSession>>;
+  try {
+    outcome = await createChildSession({
+      orgId: claims.orgId,
+      actorId: claims.userId || null,
+      parentRunId: run.id,
+      threadId: run.threadId,
+      prompt,
+      title: title || undefined,
+      engine: run.engine,
+      model: run.model,
+      repos: run.repos,
+      memoryScope: run.memoryScope,
+      idempotencyKey,
+    });
+  } catch (error) {
+    const refusal = childSessionRefusalResult(error);
+    if (refusal) return refusal;
+    throw error;
+  }
   if (outcome.status === "conflict") {
     return errorResult(
       "idempotencyKey was already used for different child session input.",
@@ -355,6 +397,8 @@ async function createMany(
       outcome,
     );
   } catch (error) {
+    const refusal = childSessionRefusalResult(error);
+    if (refusal) return refusal;
     return errorResult(error instanceof Error ? error.message : "child fan-out failed");
   }
 }
@@ -576,12 +620,17 @@ async function executeThroughPrimaryApi(
     signal: AbortSignal.timeout(30_000),
   });
   const body = (await response.json().catch(() => null)) as
-    | { result?: ToolCallResult; error?: string }
+    | ({ result?: ToolCallResult; error?: string; message?: string } & Record<string, unknown>)
     | null;
   if (!response.ok || !body?.result) {
+    const { error, message, result: _result, ...details } = body ?? {};
     return errorResult(
-      body?.error ?? `child-session control plane returned HTTP ${response.status}`,
-      { status: response.status },
+      message ?? error ?? `child-session control plane returned HTTP ${response.status}`,
+      {
+        ...(error ? { code: error } : {}),
+        status: response.status,
+        ...details,
+      },
     );
   }
   return body.result;
